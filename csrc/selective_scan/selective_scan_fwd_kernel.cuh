@@ -290,7 +290,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
                 #pragma unroll
                 for (int i = 0; i < kNItems; ++i) {
                     float z_val = z_vals[i];
-                    out_vals[r][i] *= z_val / (1 + expf(-z_val));
+                    out_vals[r][i] *= max(0.0f, z_val); // min(max(0.0f, z_val), 1.0f); //out_vals[r][i] *= z_val / (1 + expf(-z_val));
                 }
                 __syncthreads();
                 store_output<Ktraits>(out_z + r * params.out_z_d_stride, out_vals[r], smem_store, params.seqlen - chunk * kChunkSize);
