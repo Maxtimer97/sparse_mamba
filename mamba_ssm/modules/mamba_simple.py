@@ -48,6 +48,7 @@ class Mamba(nn.Module):
         layer_idx=None,
         device=None,
         dtype=None,
+        sparse=False,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -72,8 +73,12 @@ class Mamba(nn.Module):
             **factory_kwargs,
         )
 
+        self.sparse = sparse
         self.activation = "silu"
-        self.act = nn.ReLU() #nn.SiLU()
+        if sparse:
+            self.act = nn.ReLU() 
+        else:
+            self.act = nn.SiLU()
 
         self.x_proj = nn.Linear(
             self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs
@@ -129,8 +134,8 @@ class Mamba(nn.Module):
             conv_state, ssm_state = self._get_states_from_cache(inference_params, batch)
             if inference_params.seqlen_offset > 0:
                 # The states are updated inplace
-                out, _, _ = self.step(hidden_states, conv_state, ssm_state)
-                return out
+                out, _, _, spar = self.step(hidden_states, conv_state, ssm_state)
+                return out, spar
 
         # We do matmul and transpose BLH -> HBL at the same time
         xz = rearrange(
@@ -198,6 +203,7 @@ class Mamba(nn.Module):
             delta_bias=self.dt_proj.bias.float(),
             delta_softplus=True,
             return_last_state=ssm_state is not None,
+            sparse = self.sparse
         )
         if ssm_state is not None:
             y, last_state = y
@@ -213,21 +219,22 @@ class Mamba(nn.Module):
         x, z = xz.chunk(2, dim=-1)  # (B D)
 
         # Conv step
-        if causal_conv1d_update is None:
-            conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))  # Update state (B D W)
-            conv_state[:, :, -1] = x
-            x = torch.sum(conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)  # (B D)
-            if self.conv1d.bias is not None:
-                x = x + self.conv1d.bias
-            x = self.act(x).to(dtype=dtype)
-        else:
-            x = causal_conv1d_update(
-                x,
-                conv_state,
-                rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                self.conv1d.bias,
-                self.activation,
-            )
+        # if causal_conv1d_update is None:
+        conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))  # Update state (B D W)
+        conv_state[:, :, -1] = x
+        x = torch.sum(conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)  # (B D)
+        if self.conv1d.bias is not None:
+            x = x + self.conv1d.bias
+        x = self.act(x).to(dtype=dtype)
+        act1_spar = torch.sum(x==0)/x.numel()
+        # else:
+        #     x = causal_conv1d_update(
+        #         x,
+        #         conv_state,
+        #         rearrange(self.conv1d.weight, "d 1 w -> d w"),
+        #         self.conv1d.bias,
+        #         self.activation,
+        #     )
 
         x_db = self.x_proj(x)  # (B dt_rank+2*d_state)
         dt, B, C = torch.split(x_db, [self.dt_rank, self.d_state, self.d_state], dim=-1)
@@ -235,23 +242,24 @@ class Mamba(nn.Module):
         dt = F.linear(dt, self.dt_proj.weight)  # (B d_inner)
         A = -torch.exp(self.A_log.float())  # (d_inner, d_state)
 
-        # SSM step
-        if selective_state_update is None:
-            # Discretize A and B
-            dt = F.softplus(dt + self.dt_proj.bias.to(dtype=dt.dtype))
-            dA = torch.exp(torch.einsum("bd,dn->bdn", dt, A))
-            dB = torch.einsum("bd,bn->bdn", dt, B)
-            ssm_state.copy_(ssm_state * dA + rearrange(x, "b d -> b d 1") * dB)
-            y = torch.einsum("bdn,bn->bd", ssm_state.to(dtype), C)
-            y = y + self.D.to(dtype) * x
-            y = y * self.act(z)  # (B D)
-        else:
-            y = selective_state_update(
-                ssm_state, x, dt, A, B, C, self.D, z=z, dt_bias=self.dt_proj.bias, dt_softplus=True
-            )
+        # # SSM step
+        # if selective_state_update is None:
+        # Discretize A and B
+        dt = F.softplus(dt + self.dt_proj.bias.to(dtype=dt.dtype))
+        dA = torch.exp(torch.einsum("bd,dn->bdn", dt, A))
+        dB = torch.einsum("bd,bn->bdn", dt, B)
+        ssm_state.copy_(ssm_state * dA + rearrange(x, "b d -> b d 1") * dB)
+        y = torch.einsum("bdn,bn->bd", ssm_state.to(dtype), C)
+        y = y + self.D.to(dtype) * x
+        y = y * self.act(z)  # (B D)
+        act2_spar = torch.sum(y==0)/y.numel()
+        # else:
+        #     y = selective_state_update(
+        #         ssm_state, x, dt, A, B, C, self.D, z=z, dt_bias=self.dt_proj.bias, dt_softplus=True
+        #     )
 
         out = self.out_proj(y)
-        return out.unsqueeze(1), conv_state, ssm_state
+        return out.unsqueeze(1), conv_state, ssm_state, [act1_spar, act2_spar]
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         device = self.out_proj.weight.device

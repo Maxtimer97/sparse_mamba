@@ -13,10 +13,22 @@ except ImportError:
     causal_conv1d_fn = None
     causal_conv1d_cuda = None
 
-import selective_scan_cuda
+import selective_scan_cuda_sparse
+
+# import selective_scan_cuda
 
 
 class SelectiveScanFn(torch.autograd.Function):
+    # Initialize as a class attribute
+    scan = None
+
+    @classmethod
+    def initialize(cls, sparse=False):
+        if sparse:
+            cls.scan = selective_scan_cuda_sparse
+        else:
+            cls.scan = selective_scan_cuda
+
 
     @staticmethod
     def forward(ctx, u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False,
@@ -39,7 +51,12 @@ class SelectiveScanFn(torch.autograd.Function):
         if C.dim() == 3:
             C = rearrange(C, "b dstate l -> b 1 dstate l")
             ctx.squeeze_C = True
-        out, x, *rest = selective_scan_cuda.fwd(u, delta, A, B, C, D, z, delta_bias, delta_softplus)
+        # if sparse:
+        #     fscan = selective_scan_cuda_sparse
+        # else:
+        #     fscan = selective_scan_cuda
+        # ctx.fscan = fscan
+        out, x, *rest = SelectiveScanFn.scan.fwd(u, delta, A, B, C, D, z, delta_bias, delta_softplus)
         ctx.delta_softplus = delta_softplus
         ctx.has_z = z is not None
         last_state = x[:, :, -1, 1::2]  # (batch, dim, dstate)
@@ -64,7 +81,8 @@ class SelectiveScanFn(torch.autograd.Function):
         # The kernel supports passing in a pre-allocated dz (e.g., in case we want to fuse the
         # backward of selective_scan_cuda with the backward of chunk).
         # Here we just pass in None and dz will be allocated in the C++ code.
-        du, ddelta, dA, dB, dC, dD, ddelta_bias, *rest = selective_scan_cuda.bwd(
+        # fscan = ctx.fscan
+        du, ddelta, dA, dB, dC, dD, ddelta_bias, *rest = SelectiveScanFn.scan.bwd(
             u, delta, A, B, C, D, z, delta_bias, dout, x, out, None, ctx.delta_softplus,
             False  # option to recompute out_z, not used here
         )
@@ -80,11 +98,12 @@ class SelectiveScanFn(torch.autograd.Function):
 
 
 def selective_scan_fn(u, delta, A, B, C, D=None, z=None, delta_bias=None, delta_softplus=False,
-                     return_last_state=False):
+                     return_last_state=False, sparse=False):
     """if return_last_state is True, returns (out, last_state)
     last_state has shape (batch, dim, dstate). Note that the gradient of the last state is
     not considered in the backward pass.
     """
+    SelectiveScanFn.initialize(sparse)
     return SelectiveScanFn.apply(u, delta, A, B, C, D, z, delta_bias, delta_softplus, return_last_state)
 
 

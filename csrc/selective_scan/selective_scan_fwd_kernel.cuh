@@ -290,6 +290,7 @@ void selective_scan_fwd_kernel(SSMParamsBase params) {
                 #pragma unroll
                 for (int i = 0; i < kNItems; ++i) {
                     float z_val = z_vals[i];
+                    //printf("Sparse");
                     out_vals[r][i] *= max(0.0f, z_val); // min(max(0.0f, z_val), 1.0f); //out_vals[r][i] *= z_val / (1 + expf(-z_val));
                 }
                 __syncthreads();

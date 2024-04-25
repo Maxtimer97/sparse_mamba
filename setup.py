@@ -129,7 +129,7 @@ if not SKIP_CUDA_BUILD:
 
     ext_modules.append(
         CUDAExtension(
-            name="selective_scan_cuda",
+            name="selective_scan_cuda_sparse",
             sources=[
                 "csrc/selective_scan/selective_scan.cpp",
                 "csrc/selective_scan/selective_scan_fwd_fp32.cu",
