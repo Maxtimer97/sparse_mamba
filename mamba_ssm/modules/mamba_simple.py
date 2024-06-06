@@ -27,7 +27,15 @@ try:
 except ImportError:
     RMSNorm, layer_norm_fn, rms_norm_fn = None, None, None
 
-print("SPARSE")
+import os
+
+import sys
+fscil_directory = os.path.dirname(os.path.abspath(__file__))
+
+
+sys.path.insert(0, os.path.join(fscil_directory,"../../quantstudy"))
+from quantstudy.models.quant_tools import QuantLinear
+
 
 class Mamba(nn.Module):
     def __init__(
@@ -49,6 +57,7 @@ class Mamba(nn.Module):
         device=None,
         dtype=None,
         sparse=False,
+        quant_bits=None,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -61,7 +70,12 @@ class Mamba(nn.Module):
         self.use_fast_path = use_fast_path
         self.layer_idx = layer_idx
 
-        self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
+        if quant_bits:
+            self.in_proj = QuantLinear(self.d_model, self.d_inner * 2, bias=bias, 
+                                       act_bits=quant_bits['act'], w_bits=quant_bits['weights'],
+                                       quant_dim=0)
+        else:
+            self.in_proj = nn.Linear(self.d_model, self.d_inner * 2, bias=bias, **factory_kwargs)
 
         self.conv1d = nn.Conv1d(
             in_channels=self.d_inner,
@@ -74,6 +88,7 @@ class Mamba(nn.Module):
         )
 
         self.sparse = sparse
+        self.quant = (quant_bits != None)
         self.activation = "silu"
         if sparse:
             self.act = nn.ReLU() 
@@ -138,11 +153,18 @@ class Mamba(nn.Module):
                 return out, spar
 
         # We do matmul and transpose BLH -> HBL at the same time
-        xz = rearrange(
-            self.in_proj.weight @ rearrange(hidden_states, "b l d -> d (b l)"),
-            "d (b l) -> b d l",
-            l=seqlen,
-        )
+        if self.quant:
+            xz = rearrange(
+                self.in_proj(rearrange(hidden_states, "b l d -> d (b l)"), seq_batch=True),
+                "d (b l) -> b d l",
+                l=seqlen,
+            )
+        else:
+            xz = rearrange(
+                self.in_proj.weight @ rearrange(hidden_states, "b l d -> d (b l)"),
+                "d (b l) -> b d l",
+                l=seqlen,
+            )
         if self.in_proj.bias is not None:
             xz = xz + rearrange(self.in_proj.bias.to(dtype=xz.dtype), "d -> d 1")
 

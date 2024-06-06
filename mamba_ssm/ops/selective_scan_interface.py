@@ -15,7 +15,7 @@ except ImportError:
 
 import selective_scan_cuda_sparse
 
-# import selective_scan_cuda
+import selective_scan_cuda
 
 
 class SelectiveScanFn(torch.autograd.Function):
