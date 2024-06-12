@@ -169,7 +169,7 @@ class Mamba2Simple(nn.Module):
                 )  # (B, L, self.d_inner + 2 * ngroups * d_state)
             else:
                 xBC = causal_conv1d_fn(
-                    x=xBC.transpose(1, 2),
+                    x=xBC.contiguous().transpose(1, 2),
                     weight=rearrange(self.conv1d.weight, "d 1 w -> d w"),
                     bias=self.conv1d.bias,
                     activation=self.activation,
