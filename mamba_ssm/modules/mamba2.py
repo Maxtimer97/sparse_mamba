@@ -94,11 +94,11 @@ class Mamba2(nn.Module):
                                                 process_group=self.process_group, sequence_parallel=self.sequence_parallel,
                                                 **factory_kwargs)
 
-        # self.rec_dt_proj = nn.Linear(self.d_inner * self.d_state, self.nheads, bias=bias, **factory_kwargs)
+        self.rec_dt_proj = nn.Linear(self.d_inner * self.d_state, self.nheads, bias=bias, **factory_kwargs)
 
-        # fan_in = self.d_inner * self.d_state
-        # bound = 1 / (10*math.sqrt(fan_in))
-        # nn.init.uniform_(self.rec_dt_proj.weight, -bound, bound)
+        fan_in = self.d_inner * self.d_state
+        bound = 1 / (10*math.sqrt(fan_in))
+        nn.init.uniform_(self.rec_dt_proj.weight, -bound, bound)
 
         conv_dim = self.d_ssm + 2 * self.ngroups * self.d_state
         self.conv1d = nn.Conv1d(
@@ -289,13 +289,13 @@ class Mamba2(nn.Module):
         x, B, C = torch.split(xBC, [self.d_ssm, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
         A = -torch.exp(self.A_log.float())  # (nheads,)
 
-        # dt_h = self.rec_dt_proj(rearrange(ssm_state, "b h p n -> b (h p n)"))
+        dt_h = self.rec_dt_proj(rearrange(ssm_state, "b h p n -> b (h p n)"))
 
         # SSM step
         # if selective_state_update is None:
         assert self.ngroups == 1, "Only support ngroups=1 for this inference code path"
         # Discretize A and B
-        dt = F.softplus(dt + self.dt_bias.to(dtype=dt.dtype))  # (batch, nheads)
+        dt = F.softplus(dt + dt_h + self.dt_bias.to(dtype=dt.dtype))  # (batch, nheads)
         dA = torch.exp(dt * A)  # (batch, nheads)
         x = rearrange(x, "b (h p) -> b h p", p=self.headdim)
         dBx = torch.einsum("bh,bn,bhp->bhpn", dt, B, x)
