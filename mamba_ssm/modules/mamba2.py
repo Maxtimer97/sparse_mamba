@@ -94,6 +94,12 @@ class Mamba2(nn.Module):
                                                 process_group=self.process_group, sequence_parallel=self.sequence_parallel,
                                                 **factory_kwargs)
 
+        # self.rec_dt_proj = nn.Linear(self.d_inner * self.d_state, self.nheads, bias=bias, **factory_kwargs)
+
+        # fan_in = self.d_inner * self.d_state
+        # bound = 1 / (10*math.sqrt(fan_in))
+        # nn.init.uniform_(self.rec_dt_proj.weight, -bound, bound)
+
         conv_dim = self.d_ssm + 2 * self.ngroups * self.d_state
         self.conv1d = nn.Conv1d(
             in_channels=conv_dim,
@@ -164,8 +170,9 @@ class Mamba2(nn.Module):
             conv_state, ssm_state = self._get_states_from_cache(inference_params, batch)
             if inference_params.seqlen_offset > 0:
                 # The states are updated inplace
+                spar = [0,0]
                 out, _, _ = self.step(u, conv_state, ssm_state)
-                return out
+                return out, spar
 
         zxbcdt = self.in_proj(u)  # (B, L, d_in_proj) or (B * L, d_in_proj)
         if seqlen_og is not None:
@@ -263,7 +270,8 @@ class Mamba2(nn.Module):
 
         # Conv step
         if causal_conv1d_update is None:
-            conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))  # Update state (B D W)
+            # conv_state.copy_(torch.roll(conv_state, shifts=-1, dims=-1))  # Update state (B D W)
+            conv_state = torch.roll(conv_state, shifts=-1, dims=-1)  # Update state (B D W)
             conv_state[:, :, -1] = xBC
             xBC = torch.sum(conv_state * rearrange(self.conv1d.weight, "d 1 w -> d w"), dim=-1)  # (B D)
             if self.conv1d.bias is not None:
@@ -281,35 +289,38 @@ class Mamba2(nn.Module):
         x, B, C = torch.split(xBC, [self.d_ssm, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
         A = -torch.exp(self.A_log.float())  # (nheads,)
 
+        # dt_h = self.rec_dt_proj(rearrange(ssm_state, "b h p n -> b (h p n)"))
+
         # SSM step
-        if selective_state_update is None:
-            assert self.ngroups == 1, "Only support ngroups=1 for this inference code path"
-            # Discretize A and B
-            dt = F.softplus(dt + self.dt_bias.to(dtype=dt.dtype))  # (batch, nheads)
-            dA = torch.exp(dt * A)  # (batch, nheads)
-            x = rearrange(x, "b (h p) -> b h p", p=self.headdim)
-            dBx = torch.einsum("bh,bn,bhp->bhpn", dt, B, x)
-            ssm_state.copy_(ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
-            y = torch.einsum("bhpn,bn->bhp", ssm_state.to(dtype), C)
-            y = y + rearrange(self.D.to(dtype), "h -> h 1") * x
-            y = rearrange(y, "b h p -> b (h p)")
-            if not self.rmsnorm:
-                y = y * self.act(z)  # (B D)
-        else:
-            A = repeat(A, "h -> h p n", p=self.headdim, n=self.d_state).to(dtype=torch.float32)
-            dt = repeat(dt, "b h -> b h p", p=self.headdim)
-            dt_bias = repeat(self.dt_bias, "h -> h p", p=self.headdim)
-            D = repeat(self.D, "h -> h p", p=self.headdim)
-            B = rearrange(B, "b (g n) -> b g n", g=self.ngroups)
-            C = rearrange(C, "b (g n) -> b g n", g=self.ngroups)
-            x_reshaped = rearrange(x, "b (h p) -> b h p", p=self.headdim)
-            if not self.rmsnorm:
-                z = rearrange(z, "b (h p) -> b h p", p=self.headdim)
-            y = selective_state_update(
-                ssm_state, x_reshaped, dt, A, B, C, D, z=z if not self.rmsnorm else None,
-                dt_bias=dt_bias, dt_softplus=True
-            )
-            y = rearrange(y, "b h p -> b (h p)")
+        # if selective_state_update is None:
+        assert self.ngroups == 1, "Only support ngroups=1 for this inference code path"
+        # Discretize A and B
+        dt = F.softplus(dt + self.dt_bias.to(dtype=dt.dtype))  # (batch, nheads)
+        dA = torch.exp(dt * A)  # (batch, nheads)
+        x = rearrange(x, "b (h p) -> b h p", p=self.headdim)
+        dBx = torch.einsum("bh,bn,bhp->bhpn", dt, B, x)
+        # ssm_state.copy_(ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
+        ssm_state = ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx
+        y = torch.einsum("bhpn,bn->bhp", ssm_state.to(dtype), C)
+        y = y + rearrange(self.D.to(dtype), "h -> h 1") * x
+        y = rearrange(y, "b h p -> b (h p)")
+        if not self.rmsnorm:
+            y = y * self.act(z)  # (B D)
+        # else:
+        #     A = repeat(A, "h -> h p n", p=self.headdim, n=self.d_state).to(dtype=torch.float32)
+        #     dt = repeat(dt, "b h -> b h p", p=self.headdim)
+        #     dt_bias = repeat(self.dt_bias, "h -> h p", p=self.headdim)
+        #     D = repeat(self.D, "h -> h p", p=self.headdim)
+        #     B = rearrange(B, "b (g n) -> b g n", g=self.ngroups)
+        #     C = rearrange(C, "b (g n) -> b g n", g=self.ngroups)
+        #     x_reshaped = rearrange(x, "b (h p) -> b h p", p=self.headdim)
+        #     if not self.rmsnorm:
+        #         z = rearrange(z, "b (h p) -> b h p", p=self.headdim)
+        #     y = selective_state_update(
+        #         ssm_state, x_reshaped, dt, A, B, C, D, z=z if not self.rmsnorm else None,
+        #         dt_bias=dt_bias, dt_softplus=True
+        #     )
+        #     y = rearrange(y, "b h p -> b (h p)")
         if self.rmsnorm:
             y = self.norm(y, z)
         if d_mlp > 0:
