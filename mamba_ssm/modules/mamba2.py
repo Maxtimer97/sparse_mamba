@@ -27,6 +27,12 @@ from mamba_ssm.ops.triton.ssd_combined import mamba_chunk_scan_combined
 from mamba_ssm.ops.triton.ssd_combined import mamba_split_conv1d_scan_combined
 
 
+import os
+import sys
+fscil_directory = os.path.dirname(os.path.abspath(__file__))
+sys.path.insert(0, os.path.join(fscil_directory,"../../quantstudy"))
+from quantstudy.models.quant_tools import QuantLinear, act_quant_fn, weight_quant_fn
+
 class Mamba2(nn.Module):
     def __init__(
         self,
@@ -39,8 +45,8 @@ class Mamba2(nn.Module):
         d_ssm=None,  # If not None, we only apply SSM on this many dimensions, the rest uses gated MLP
         ngroups=1,
         A_init_range=(1, 16),
-        D_has_hdim=False,
-        rmsnorm=True,
+        D_has_hdim=True,
+        rmsnorm=False,
         norm_before_gate=False,
         dt_min=0.001,
         dt_max=0.1,
@@ -56,6 +62,11 @@ class Mamba2(nn.Module):
         sequence_parallel=True,
         device=None,
         dtype=None,
+        # extra param for quantization
+        sparse=False,
+        quant_bits=None,
+        taylor_exp=False,
+        no_sftplus=False,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -85,14 +96,27 @@ class Mamba2(nn.Module):
         self.use_mem_eff_path = use_mem_eff_path
         self.layer_idx = layer_idx
 
+        self.sparse = sparse
+        self.quant = (quant_bits != None)
+        self.quant_bits = quant_bits
+        self.taylor_exp = taylor_exp
+        self.no_sftplus = no_sftplus
+
         # Order: [z, x, B, C, dt]
         d_in_proj = 2 * self.d_inner + 2 * self.ngroups * self.d_state + self.nheads
-        if self.process_group is None:
-            self.in_proj = nn.Linear(self.d_model, d_in_proj, bias=bias, **factory_kwargs)
+        # if self.process_group is None:
+        #     self.in_proj = nn.Linear(self.d_model, d_in_proj, bias=bias, **factory_kwargs)
+        # else:
+        #     self.in_proj = ColumnParallelLinear(self.d_model, d_in_proj * self.world_size, bias=bias,
+        #                                         process_group=self.process_group, sequence_parallel=self.sequence_parallel,
+        #                                         **factory_kwargs)
+
+        if quant_bits:
+            self.in_proj = QuantLinear(self.d_model, d_in_proj, bias=bias, 
+                                       act_bits=quant_bits['act'], w_bits=quant_bits['weights'])
         else:
-            self.in_proj = ColumnParallelLinear(self.d_model, d_in_proj * self.world_size, bias=bias,
-                                                process_group=self.process_group, sequence_parallel=self.sequence_parallel,
-                                                **factory_kwargs)
+            self.in_proj = nn.Linear(self.d_model, d_in_proj, bias=bias, **factory_kwargs)
+
 
         self.rec_dt_proj = nn.Linear(self.d_inner * self.d_state, self.nheads, bias=bias, **factory_kwargs)
 
@@ -107,13 +131,18 @@ class Mamba2(nn.Module):
             bias=conv_bias,
             kernel_size=d_conv,
             groups=conv_dim,
-            padding=d_conv - 1,
+            padding='same', #d_conv - 1,
             **factory_kwargs,
         )
         if self.conv_init is not None:
             nn.init.uniform_(self.conv1d.weight, -self.conv_init, self.conv_init)
 
-        self.act = nn.SiLU()
+
+        if sparse:
+            self.activation = "relu"
+            self.act = nn.ReLU()
+        else:
+            self.act = nn.SiLU()
 
         # Initialize log dt bias
         dt = torch.exp(
@@ -134,7 +163,6 @@ class Mamba2(nn.Module):
         self.A_log = nn.Parameter(A_log)
         self.A_log._no_weight_decay = True
 
-        # D "skip" parameter
         self.D = nn.Parameter(torch.ones(self.d_ssm if self.D_has_hdim else self.nheads, device=device))
         self.D._no_weight_decay = True
 
@@ -143,12 +171,19 @@ class Mamba2(nn.Module):
             self.norm = RMSNormGated(self.d_ssm, eps=1e-5, norm_before_gate=self.norm_before_gate,
                                      group_size=self.d_ssm // ngroups, **factory_kwargs)
 
-        if self.process_group is None:
-            self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+        # if self.process_group is None:
+        #     self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+        # else:
+        #     self.out_proj = RowParallelLinear(self.d_inner * self.world_size, self.d_model, bias=bias,
+        #                                       process_group=self.process_group, sequence_parallel=self.sequence_parallel,
+        #                                       **factory_kwargs)
+
+        if quant_bits:
+            self.out_proj = QuantLinear(self.d_inner, self.d_model, bias=bias, 
+                                       act_bits=quant_bits['act'], w_bits=quant_bits['weights'])
         else:
-            self.out_proj = RowParallelLinear(self.d_inner * self.world_size, self.d_model, bias=bias,
-                                              process_group=self.process_group, sequence_parallel=self.sequence_parallel,
-                                              **factory_kwargs)
+            self.out_proj = nn.Linear(self.d_inner, self.d_model, bias=bias, **factory_kwargs)
+
 
     def forward(self, u, seqlen=None, seq_idx=None, inference_params=None):
         """
@@ -179,7 +214,7 @@ class Mamba2(nn.Module):
             zxbcdt = rearrange(zxbcdt, "(b l) d -> b l d", l=seqlen)
         A = -torch.exp(self.A_log)  # (nheads) or (d_inner, d_state)
         dt_limit_kwargs = {} if self.dt_limit == (0.0, float("inf")) else dict(dt_limit=self.dt_limit)
-        if self.use_mem_eff_path and inference_params is None:
+        if self.use_mem_eff_path and inference_params is None and not (self.sparse or self.quant or self.taylor_exp or self.no_sftplus):
             out = mamba_split_conv1d_scan_combined(
                 zxbcdt,
                 rearrange(self.conv1d.weight, "d 1 w -> d w"),
@@ -216,7 +251,7 @@ class Mamba2(nn.Module):
                 # Instead F.pad will pad with zeros if seqlen < self.d_conv, and truncate otherwise.
                 xBC_t = rearrange(xBC, "b l d -> b d l")
                 conv_state.copy_(F.pad(xBC_t, (self.d_conv - xBC_t.shape[-1], 0)))  # Update state (B D W)
-            assert self.activation in ["silu", "swish"]
+            # assert self.activation in ["silu", "swish"]
             if causal_conv1d_fn is None or self.activation not in ["silu", "swish"]:
                 xBC = self.act(
                     self.conv1d(xBC.transpose(1, 2)).transpose(1, 2)
@@ -228,7 +263,21 @@ class Mamba2(nn.Module):
                     bias=self.conv1d.bias,
                     activation=self.activation,
                 ).transpose(1, 2)
+            if self.quant:
+                act_levels = 2**(self.quant_bits['act']-1)-1
+                xBC = xBC + (act_quant_fn(xBC, act_levels, -1) - xBC).detach()
             x, B, C = torch.split(xBC, [self.d_ssm, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
+            
+            if self.no_sftplus:
+                def softplus_taylor_approx_3rd_order(x):
+                    return torch.log(torch.tensor(2.0)) + 0.5 * x + (1/8) * x**2 + (1/48) * x**3
+                dt = dt + self.dt_bias.to(dtype=dt.dtype)
+                # dt = torch.where(dt < -2, torch.tensor(0.0), 
+                #          torch.where(dt > 2, dt, dt/2 + 1))
+                dt = torch.where(dt < -2, torch.tensor(0.0), 
+                         torch.where(dt > 2, dt, softplus_taylor_approx_3rd_order(dt)))
+            
+
             y = mamba_chunk_scan_combined(
                 rearrange(x, "b l (h p) -> b l h p", p=self.headdim),
                 dt,
@@ -236,20 +285,48 @@ class Mamba2(nn.Module):
                 rearrange(B, "b l (g n) -> b l g n", g=self.ngroups),
                 rearrange(C, "b l (g n) -> b l g n", g=self.ngroups),
                 chunk_size=self.chunk_size,
-                D=rearrange(self.D, "(h p) -> h p", p=self.headdim) if self.D_has_hdim else self.D,
-                z=rearrange(z, "b l (h p) -> b l h p", p=self.headdim) if not self.rmsnorm else None,
-                dt_bias=self.dt_bias,
-                dt_softplus=True,
+                D=None, #rearrange(self.D, "(h p) -> h p", p=self.headdim) if self.D_has_hdim else self.D,
+                z=None, #rearrange(z, "b l (h p) -> b l h p", p=self.headdim) if not self.rmsnorm else None,
+                dt_bias=self.dt_bias if not self.no_sftplus else None,
+                dt_softplus=not self.no_sftplus,
                 seq_idx=seq_idx,
                 **dt_limit_kwargs,
                 return_final_states=ssm_state is not None,
+                taylor_exp=self.taylor_exp,
             )
+            y = rearrange(y, "b l h p -> b l (h p)")
+            if self.sparse:
+                y = self.act(y)
+            if self.quant:
+                act_levels = 2**(self.quant_bits['act']-1)-1
+                y = y + (act_quant_fn(y, act_levels, -1) - y).detach()
+
+            # if self.quant:
+            #     act_levels = 2**(self.quant_bits['act']-1)-1
+            #     w_levels = 2**(self.quant_bits['weights']-1)-1
+
+            #     x_quant = x + (act_quant_fn(x, act_levels, -1) - x).detach()
+            #     D_quant = self.D + (weight_quant_fn(self.D, w_levels, -1) - self.D).detach()
+            #     # if seq_batch:
+            #     #     y = w_quant @ x_quant
+            #     # else:
+            #     y = y + F.linear(x_quant, D_quant)
+            # else:
+            y = y + self.D * x
+
+
+
             if ssm_state is not None:
                 y, last_state = y
                 ssm_state.copy_(last_state)
-            y = rearrange(y, "b l h p -> b l (h p)")
+            # y = rearrange(y, "b l h p -> b l (h p)")
             if self.rmsnorm:
                 y = self.norm(y, z)
+            else:
+                y = y * self.act(z)  # (B D)
+            if self.quant:
+                act_levels = 2**(self.quant_bits['act']-1)-1
+                y = y + (act_quant_fn(y, act_levels, -1) - y).detach()
             if d_mlp > 0:
                 y = torch.cat([F.silu(z0) * x0, y], dim=-1)
             if seqlen_og is not None:

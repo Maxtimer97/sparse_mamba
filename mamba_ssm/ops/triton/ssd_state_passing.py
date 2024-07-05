@@ -41,6 +41,7 @@ def _state_passing_fwd_kernel(
     HAS_INITSTATES: tl.constexpr,
     HAS_SEQ_IDX: tl.constexpr,
     BLOCK_SIZE: tl.constexpr,
+    TAYLOR_EXP: tl.constexpr,
 ):
     pid_b = tl.program_id(axis=1)
     pid_h = tl.program_id(axis=2)
@@ -70,7 +71,34 @@ def _state_passing_fwd_kernel(
     for c in range(nchunks):
         new_states = tl.load(states_ptrs, mask=offs_m < dim, other=0.0).to(tl.float32)
         dA_cs = tl.load(dA_cs_ptr).to(tl.float32)
-        scale = tl.exp(dA_cs)
+        if TAYLOR_EXP:
+            #Avoid nans by bringing high negative dA values to the power
+            x = tl.maximum(dA_cs, -10000.0)
+            x2 = x * x
+            x3 = x2 * x
+            x4 = x3 * x
+            x5 = x4 * x
+
+            scale = 1 + x + x2 / 2 + x3 / 6+ x4 / 24 + x5 / 120
+
+            #Rescaling to match exponential value range
+            scale = tl.minimum(tl.maximum(scale, 0.0), 1.0)
+            # scale = 1 + dA_cs
+            # term = dA_cs
+            
+            # term = term * dA_cs / 2
+            # scale += term
+            
+            # term = term * dA_cs / 3
+            # scale += term
+            
+            # term = term * dA_cs / 4
+            # scale += term
+            
+            # term = term * dA_cs / 5
+            # scale += term
+        else:
+            scale = tl.exp(dA_cs)
         if HAS_SEQ_IDX:
             seq_idx_new = tl.load(seq_idx_ptr + (min((c + 1) * chunk_size, seqlen) - 1) * stride_seq_idx_seqlen)
             scale = tl.where(seq_idx_new == seq_idx, scale, 0.0)
@@ -192,7 +220,7 @@ def _state_passing_bwd_kernel(
 
 
 def _state_passing_fwd(states, dA_chunk_cumsum, initial_states=None, seq_idx=None, chunk_size=None,
-                       out_dtype=None):
+                       out_dtype=None, taylor_exp=False):
     batch, nchunks, nheads, dim = states.shape
     assert dA_chunk_cumsum.shape == (batch, nheads, nchunks)
     if initial_states is not None:
@@ -217,7 +245,7 @@ def _state_passing_fwd(states, dA_chunk_cumsum, initial_states=None, seq_idx=Non
               if initial_states is not None else (0, 0, 0)),
             *((seq_idx.stride(0), seq_idx.stride(1)) if seq_idx is not None else (0, 0)),
             HAS_INITSTATES=initial_states is not None,
-            HAS_SEQ_IDX=seq_idx is not None,
+            HAS_SEQ_IDX=seq_idx is not None, TAYLOR_EXP=taylor_exp,
         )
     return out, final_states
 
