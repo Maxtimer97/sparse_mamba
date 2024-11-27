@@ -79,7 +79,7 @@ def _state_passing_fwd_kernel(
             x4 = x3 * x
             x5 = x4 * x
 
-            scale = 1 + x + x2 / 2 + x3 / 6+ x4 / 24 + x5 / 120
+            scale = 1 + x + x2/2 + x3/6 + x4/24 + x5/120
 
             #Rescaling to match exponential value range
             scale = tl.minimum(tl.maximum(scale, 0.0), 1.0)

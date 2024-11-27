@@ -232,7 +232,7 @@ class Mamba(nn.Module):
             ssm_state.copy_(last_state)
         y = rearrange(y, "b d l -> b l d")
         out = self.out_proj(y)
-        return out
+        return out, None
 
     def step(self, hidden_states, conv_state, ssm_state):
         dtype = hidden_states.dtype

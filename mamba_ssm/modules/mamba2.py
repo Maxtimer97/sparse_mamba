@@ -263,6 +263,8 @@ class Mamba2(nn.Module):
                     bias=self.conv1d.bias,
                     activation=self.activation,
                 ).transpose(1, 2)
+
+
             if self.quant:
                 act_levels = 2**(self.quant_bits['act']-1)-1
                 xBC = xBC + (act_quant_fn(xBC, act_levels, -1) - xBC).detach()
@@ -276,6 +278,9 @@ class Mamba2(nn.Module):
                 #          torch.where(dt > 2, dt, dt/2 + 1))
                 dt = torch.where(dt < -2, torch.tensor(0.0), 
                          torch.where(dt > 2, dt, softplus_taylor_approx_3rd_order(dt)))
+            # else:
+            #     dt = dt + self.dt_bias.to(dtype=dt.dtype)
+            #     dt = F.relu(dt + 1.0)
             
 
             y = mamba_chunk_scan_combined(
@@ -324,9 +329,11 @@ class Mamba2(nn.Module):
                 y = self.norm(y, z)
             else:
                 y = y * self.act(z)  # (B D)
+
             if self.quant:
                 act_levels = 2**(self.quant_bits['act']-1)-1
                 y = y + (act_quant_fn(y, act_levels, -1) - y).detach()
+
             if d_mlp > 0:
                 y = torch.cat([F.silu(z0) * x0, y], dim=-1)
             if seqlen_og is not None:
@@ -355,34 +362,81 @@ class Mamba2(nn.Module):
                 xBC = xBC + self.conv1d.bias
             xBC = self.act(xBC).to(dtype=dtype)
         else:
-            xBC = causal_conv1d_update(
-                xBC,
-                conv_state,
-                rearrange(self.conv1d.weight, "d 1 w -> d w"),
-                self.conv1d.bias,
-                self.activation,
-            )
+            xBC = causal_conv1d_fn(
+                    xBC.transpose(1, 2),
+                    rearrange(self.conv1d.weight, "d 1 w -> d w"),
+                    bias=self.conv1d.bias,
+                    activation=self.activation,
+                ).transpose(1, 2)
 
+
+
+        if self.quant:
+            act_levels = 2**(self.quant_bits['act']-1)-1
+            xBC = xBC + (act_quant_fn(xBC, act_levels, -1) - xBC).detach()
         x, B, C = torch.split(xBC, [self.d_ssm, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
         A = -torch.exp(self.A_log.float())  # (nheads,)
 
-        dt_h = self.rec_dt_proj(rearrange(ssm_state, "b h p n -> b (h p n)"))
+        # dt_h = self.rec_dt_proj(rearrange(ssm_state, "b h p n -> b (h p n)"))
 
         # SSM step
         # if selective_state_update is None:
         assert self.ngroups == 1, "Only support ngroups=1 for this inference code path"
         # Discretize A and B
-        dt = F.softplus(dt + dt_h + self.dt_bias.to(dtype=dt.dtype))  # (batch, nheads)
-        dA = torch.exp(dt * A)  # (batch, nheads)
+        if self.no_sftplus:
+            def softplus_taylor_approx_3rd_order(x):
+                return torch.log(torch.tensor(2.0)) + 0.5 * x + (1/8) * x**2 + (1/48) * x**3
+            dt = dt + self.dt_bias.to(dtype=dt.dtype)
+            # dt = torch.where(dt < -2, torch.tensor(0.0), 
+            #          torch.where(dt > 2, dt, dt/2 + 1))
+            dt = torch.where(dt < -2, torch.tensor(0.0), 
+                        torch.where(dt > 2, dt, softplus_taylor_approx_3rd_order(dt)))
+        else:
+            dt = F.softplus(dt + self.dt_bias.to(dtype=dt.dtype))  # (batch, nheads)
+
+
+        if self.taylor_exp:
+            def taylor_approx_5th_order(x):
+                return torch.tensor(1.0) + x + (1/2) * x**2 + (1/6) * x**3 + (1/24)*x**4 + (1/120)*x**5
+            dA = torch.maximum(dt*A, -10000.0)
+            scale = taylor_approx_5th_order(dA)
+            scale = torch.minimum(torch.maximum(scale, 0.0), 1.0)
+        else:
+            scale = torch.exp(dt * A)  # (batch, nheads)
+
         x = rearrange(x, "b (h p) -> b h p", p=self.headdim)
         dBx = torch.einsum("bh,bn,bhp->bhpn", dt, B, x)
         # ssm_state.copy_(ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx)
-        ssm_state = ssm_state * rearrange(dA, "b h -> b h 1 1") + dBx
+        ssm_state = ssm_state * rearrange(scale, "b h -> b h 1 1") + dBx
         y = torch.einsum("bhpn,bn->bhp", ssm_state.to(dtype), C)
+
+
+        y = rearrange(y, "b l h p -> b l (h p)")
+        if self.sparse:
+            y = self.act(y)
+        if self.quant:
+            act_levels = 2**(self.quant_bits['act']-1)-1
+            y = y + (act_quant_fn(y, act_levels, -1) - y).detach()
+
         y = y + rearrange(self.D.to(dtype), "h -> h 1") * x
         y = rearrange(y, "b h p -> b (h p)")
         if not self.rmsnorm:
             y = y * self.act(z)  # (B D)
+
+        if self.rmsnorm:
+            y = self.norm(y, z)
+
+        if self.quant:
+            act_levels = 2**(self.quant_bits['act']-1)-1
+            y = y + (act_quant_fn(y, act_levels, -1) - y).detach()
+
+        if d_mlp > 0:
+            y = torch.cat([F.silu(z0) * x0, y], dim=-1)
+
+        out = self.out_proj(y)
+
+        return out.unsqueeze(1), conv_state, ssm_state
+
         # else:
         #     A = repeat(A, "h -> h p n", p=self.headdim, n=self.d_state).to(dtype=torch.float32)
         #     dt = repeat(dt, "b h -> b h p", p=self.headdim)
@@ -398,12 +452,6 @@ class Mamba2(nn.Module):
         #         dt_bias=dt_bias, dt_softplus=True
         #     )
         #     y = rearrange(y, "b h p -> b (h p)")
-        if self.rmsnorm:
-            y = self.norm(y, z)
-        if d_mlp > 0:
-            y = torch.cat([F.silu(z0) * x0, y], dim=-1)
-        out = self.out_proj(y)
-        return out.unsqueeze(1), conv_state, ssm_state
 
     def allocate_inference_cache(self, batch_size, max_seqlen, dtype=None, **kwargs):
         device = self.out_proj.weight.device
