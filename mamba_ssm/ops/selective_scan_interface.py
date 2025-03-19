@@ -13,6 +13,7 @@ except ImportError:
     causal_conv1d_fn = None
     causal_conv1d_cuda = None
 
+print('FINAL')
 import selective_scan_cuda_sparse
 
 import selective_scan_cuda

@@ -58,6 +58,7 @@ class Mamba(nn.Module):
         dtype=None,
         sparse=False,
         quant_bits=None,
+        dt_relu=None,
     ):
         factory_kwargs = {"device": device, "dtype": dtype}
         super().__init__()
@@ -69,6 +70,7 @@ class Mamba(nn.Module):
         self.dt_rank = math.ceil(self.d_model / 16) if dt_rank == "auto" else dt_rank
         self.use_fast_path = use_fast_path
         self.layer_idx = layer_idx
+        self.dt_relu = dt_relu
 
         if quant_bits:
             self.in_proj = QuantLinear(self.d_model, self.d_inner * 2, bias=bias, 
@@ -98,28 +100,38 @@ class Mamba(nn.Module):
         self.x_proj = nn.Linear(
             self.d_inner, self.dt_rank + self.d_state * 2, bias=False, **factory_kwargs
         )
-        self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
-
-        # Initialize special dt projection to preserve variance at initialization
+        
         dt_init_std = self.dt_rank**-0.5 * dt_scale
-        if dt_init == "constant":
-            nn.init.constant_(self.dt_proj.weight, dt_init_std)
-        elif dt_init == "random":
-            nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
-        else:
-            raise NotImplementedError
 
-        # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
-        dt = torch.exp(
-            torch.rand(self.d_inner, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
-            + math.log(dt_min)
-        ).clamp(min=dt_init_floor)
-        # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
-        inv_dt = dt + torch.log(-torch.expm1(-dt))
-        with torch.no_grad():
-            self.dt_proj.bias.copy_(inv_dt)
-        # Our initialization would set all Linear.bias to zero, need to mark this one as _no_reinit
-        self.dt_proj.bias._no_reinit = True
+        if self.dt_relu=="mlp":
+            self.dt_proj1 = nn.Linear(self.dt_rank, self.dt_rank, bias=True, **factory_kwargs)
+            self.dt_proj2 = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
+            self.dt_proj = nn.Sequential(self.dt_proj1, nn.ReLU(), self.dt_proj2)
+            nn.init.uniform_(self.dt_proj1.weight, -dt_init_std, dt_init_std)
+            nn.init.uniform_(self.dt_proj2.weight, -dt_init_std, dt_init_std)
+        else:
+            self.dt_proj = nn.Linear(self.dt_rank, self.d_inner, bias=True, **factory_kwargs)
+
+            # Initialize special dt projection to preserve variance at initialization
+            if dt_init == "constant":
+                nn.init.constant_(self.dt_proj.weight, dt_init_std)
+            elif dt_init == "random":
+                nn.init.uniform_(self.dt_proj.weight, -dt_init_std, dt_init_std)
+            else:
+                raise NotImplementedError
+
+        if not self.dt_relu:
+            # Initialize dt bias so that F.softplus(dt_bias) is between dt_min and dt_max
+            dt = torch.exp(
+                torch.rand(self.d_inner, **factory_kwargs) * (math.log(dt_max) - math.log(dt_min))
+                + math.log(dt_min)
+            ).clamp(min=dt_init_floor)
+            # Inverse of softplus: https://github.com/pytorch/pytorch/issues/72759
+            inv_dt = dt + torch.log(-torch.expm1(-dt))
+            with torch.no_grad():
+                self.dt_proj.bias.copy_(inv_dt)
+            # Our initialization would set all Linear.bias to zero, need to mark this one as _no_reinit
+            self.dt_proj.bias._no_reinit = True
 
         # S4D real initialization
         A = repeat(
@@ -209,7 +221,15 @@ class Mamba(nn.Module):
         # and L as the fastest moving dimension, since those are what the ssm_scan kernel expects.
         x_dbl = self.x_proj(rearrange(x, "b d l -> (b l) d"))  # (bl d)
         dt, B, C = torch.split(x_dbl, [self.dt_rank, self.d_state, self.d_state], dim=-1)
-        dt = self.dt_proj.weight @ dt.t()
+        if self.dt_relu!=None:
+            dt = F.relu(self.dt_proj(dt)).t()
+            dt_bias = torch.zeros(self.d_inner, device=dt.device)
+            use_softplus = False
+        else:
+            dt = self.dt_proj.weight @ dt.t()
+            dt_bias = self.dt_proj.bias.float()
+            use_softplus = True
+
         dt = rearrange(dt, "d (b l) -> b d l", l=seqlen)
         B = rearrange(B, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
         C = rearrange(C, "(b l) dstate -> b dstate l", l=seqlen).contiguous()
@@ -222,8 +242,8 @@ class Mamba(nn.Module):
             C,
             self.D.float(),
             z=z,
-            delta_bias=self.dt_proj.bias.float(),
-            delta_softplus=True,
+            delta_bias=dt_bias,
+            delta_softplus=use_softplus,
             return_last_state=ssm_state is not None,
             sparse = self.sparse
         )
